@@ -192,38 +192,53 @@ ls /workspace/models/DeepSeek-R1-Distill-Qwen-7B/
 
 ```bash
 cd /workspace
-git clone https://github.com/<你的账号>/<repo>.git pilot_code
-
-# 或者 scp：
-# scp -r -P <PORT> ./0_pilot root@<POD_IP>:/workspace/pilot_code
+git clone https://github.com/kanbrtkuy/pilot.git pilot_code
 ```
 
 ---
 
-## 【RunPod】Step 9：dry run
+## 【RunPod】Step 9：dry run + 修 3 个已知 bug
+
+**先读 KNOWN_ISSUES.md**：
+
+```bash
+cat /workspace/pilot_code/KNOWN_ISSUES.md
+```
+
+里面有 3 个 Codex 审查发现的 bug，必须在 dry run 阶段修复：
+1. Hook 输出格式检查（tuple vs tensor）
+2. Prefill 阶段首条记录处理
+3. Gemini 解析 robustness
+
+**修完后跑 dry run**：
 
 ```bash
 cd /workspace/pilot_code
 conda activate pilot
 
-# 只跑 3 条样本，验证全流程
+# 先下载数据（Tier 1 编码 + Tier 2 WildJailbreak）
+python 00_prepare_data.py
+
+# dry run：只跑 3 条样本，验证 hook + hidden state 保存
 python 01_generate_cot_save_hs.py --dry-run --n 3
 
 # 人工检查
 python -c "
 import numpy as np
-hs = np.load('data/generated/group1_drift/hs_0000.npz')
-print('layers:', list(hs.keys()))
-for k in hs.keys():
-    print(f'  {k}: shape={hs[k].shape}')
-# 预期：layer_X: (n_tokens, 3584)
+hs = np.load('data/generated/T1_harmful/hs_0000.npz')
+print('layers:', sorted(hs.keys()))
+for k in sorted(hs.keys())[:3]:
+    print(f'  {k}: shape={hs[k].shape}, dtype={hs[k].dtype}')
+# 预期：layer_X: (n_tokens, 3584), dtype=float16
+# 应该有 28 个 layer key（layer_0 到 layer_27）
 "
 ```
 
 检查点：
 - `</think>` 解析是否正确
-- hidden state shape 是否符合预期
+- hidden state 有 28 层，shape = (n_tokens, 3584)，dtype = float16
 - CoT 文本是否正常生成
+- Hook 输出类型是 tuple 还是 tensor（按 KNOWN_ISSUES.md 修复）
 
 ---
 
