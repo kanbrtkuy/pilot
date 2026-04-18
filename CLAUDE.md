@@ -10,11 +10,26 @@ This is a **pilot experiment** testing whether **reasoning drift** is detectable
 
 ## Model
 
-**DeepSeek-R1-Distill-Qwen-7B**
+**DeepSeek-R1-Distill-Qwen-14B** (pivoted 2026-04-18; see "Methodology pivot log" below)
 - Architecture: Qwen2ForCausalLM
-- 28 layers (0-27), hidden_dim = 3584
-- All 28 layers saved as float16
+- 48 layers (0-47), hidden_dim = 5120, num_kv_heads = 8 (GQA)
+- All 48 layers saved as float16
 - No system prompt (official recommendation)
+
+## Methodology pivot log
+
+### 2026-04-18 — 7B → 14B + Tier 1 encoding simplification
+
+**Cipher change (stacked → single-layer)**: SEAL 原配方是 ROT13+Base64，验证在 671B 满血 R1。7B distill 在 n=3 stacked-cipher dry-run 中 0/3 闭合 `</think>`，3/3 打满 2048 cap。改为单层 Base64。
+
+**Model upgrade (7B → 14B)**: base64-only 下 7B 跑 n=20（cap=4096）仍然 0/20 成功解码：
+- `decoded` 关键词命中 18/20 (90%)，但模型说 "decoded:" 后输出的是幻觉文本
+- Lexical overlap（raw plaintext 内容词 ∩ CoT 内容词 / raw 内容词集合）均值仅 7-8%
+- 0/20 达到 ≥50% overlap 阈值；仅 1/20 达到 25-50% (PARTIAL)
+- 结论：7B distill 缺乏稳定 base64 解码能力 → H1 假设"drift 在 decode 瞬间发生"的前提不成立
+- Action：升级到 14B 验证 capability 阈值是否在这档达标
+
+Pivot 证据数据保留在 `data/generated/T1_harmful_7B_n20_baseline/` 与 `dry_run_v4.log`，可作为 7B capability ceiling 的 negative result。
 
 ## Data Design (Two-Tier)
 

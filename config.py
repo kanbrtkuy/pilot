@@ -3,10 +3,20 @@ config.py — 共享配置：路径、模型参数、常量
 
 所有 pilot 脚本从这里导入，避免重复定义和不一致。
 
-模型：DeepSeek-R1-Distill-Qwen-7B
-  - num_hidden_layers = 28 (layers 0-27)
-  - hidden_size = 3584
-  - 来源：https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+模型：DeepSeek-R1-Distill-Qwen-14B  (pilot pivot 2026-04-18)
+  - num_hidden_layers = 48 (layers 0-47)
+  - hidden_size = 5120
+  - num_key_value_heads = 8  (GQA)
+  - 来源：https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+
+Pivot 依据（见 docs/ 中的 pilot pivot 记录）：
+  7B distill 在 n=20 base64-only T1_harmful 上 decode 失败率 = 100%
+  （"decoded" 关键词命中 90%，但 claimed decode 与真实 plaintext
+   lexical overlap 均值仅 7-8%，0/20 达到 ≥50% 阈值）。
+  H1 假设"R1 会在 CoT 解密后产生 drift"在 7B 上前提不成立。
+  升级到 14B 以验证 capability 阈值是否在这个档位达标。
+
+7B legacy 值（pivot 前）：N_LAYERS=28, HIDDEN_DIM=3584, kv_heads=4
 """
 
 from pathlib import Path
@@ -33,23 +43,25 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ══════════════════════════════════════════════════
-# 模型参数（R1-Distill-Qwen-7B）
+# 模型参数（R1-Distill-Qwen-14B）
 # ══════════════════════════════════════════════════
 
-N_LAYERS = 28          # 7B 模型总层数（0-27）
-HIDDEN_DIM = 3584      # hidden_size
-MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+N_LAYERS = 48          # 14B 模型总层数（0-47）
+HIDDEN_DIM = 5120      # hidden_size
+NUM_KV_HEADS = 8       # GQA
+MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 
-# 保存全部 28 层的 hidden states
-# 好处：不用事先猜哪些层最好，CPU 分析阶段做完整 layer sweep
-# 存储：200 条 × 28 层 × ~500 tokens × 3584 dim × float16 ≈ 12-16 GB（压缩后）
-LAYERS_TO_SAVE = list(range(N_LAYERS))  # [0, 1, 2, ..., 27]
+# 保存全部 48 层的 hidden states
+# 存储估算（下采样到 100 checkpoint 后）：
+#   200 条 × 48 层 × 100 checkpoint × 5120 dim × float16 ≈ 10 MB/样本 × 200 = 2 GB
+LAYERS_TO_SAVE = list(range(N_LAYERS))  # [0, 1, 2, ..., 47]
 
 # 中间层子集（harmfulness 信号预期最强的区间，占总层数 40%-60%）
-MID_LAYERS = [11, 12, 13, 14, 15, 16]
+# 48 层的 40%-60% = [19, 29]，取中心窗口
+MID_LAYERS = [22, 23, 24, 25, 26]
 
-# 多层 MLP 用的三层（浅/中/深）
-MULTI_LAYERS = [6, 13, 27]
+# 多层 MLP 用的三层（浅/中/深）—— 按 7B 的相对位置 (6/28, 13/28, 27/28) 等比映射
+MULTI_LAYERS = [10, 22, 47]
 
 # hidden state 保存精度
 SAVE_DTYPE = "float16"  # 节省一半存储，精度损失可忽略
@@ -58,8 +70,21 @@ SAVE_DTYPE = "float16"  # 节省一半存储，精度损失可忽略
 # 分析参数
 # ══════════════════════════════════════════════════
 
-N_CHECKPOINTS = 20     # CoT 归一化为 20 个时间步
+N_CHECKPOINTS = 20     # CoT 归一化为 20 个时间步（分析阶段子采样用）
 MIN_TOKENS = 20        # 少于此数的 CoT 跳过（避免退化采样）
+
+# 生成阶段的 HS 下采样（对齐工业部署 budget）
+TARGET_MAX_TOKENS = 2048    # 工业实际 cap ~2-3K；pilot 用 2K 做 ecological-validity 主测
+N_SAVE_CHECKPOINTS = 100    # 每样本保存 100 个 checkpoint（1% 相对精度，磁盘 ~20 MB/样本）
+DECODE_MARKERS = [
+    "decoded",
+    "result is",
+    "the instruction is",
+    "解码结果",
+    "解码后",
+    "decoded message",
+    "decoded text",
+]
 
 # ══════════════════════════════════════════════════
 # 数据分组

@@ -14,6 +14,7 @@
 
 import sys
 import json
+import hashlib
 import argparse
 import numpy as np
 import pandas as pd
@@ -26,22 +27,31 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 try:
     from config import (
         MODEL_NAME, N_LAYERS, LAYERS_TO_SAVE, SAVE_DTYPE,
-        DATA_DIR, GENERATED_DIR
+        DATA_DIR, GENERATED_DIR,
+        TARGET_MAX_TOKENS, N_SAVE_CHECKPOINTS, DECODE_MARKERS,
     )
 except ImportError:
-    MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-    N_LAYERS = 28
-    LAYERS_TO_SAVE = list(range(28))
+    MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+    N_LAYERS = 48
+    LAYERS_TO_SAVE = list(range(48))
     SAVE_DTYPE = "float16"
     _dir = Path(__file__).resolve().parent
     _root = _dir.parent.parent if _dir.parent.name == "code" else _dir
     DATA_DIR = _root / "data"
     GENERATED_DIR = DATA_DIR / "generated"
+    TARGET_MAX_TOKENS = 4096
+    N_SAVE_CHECKPOINTS = 100
+    DECODE_MARKERS = ["decoded", "result is", "the instruction is", "解码结果", "解码后"]
 
-# RunPod 上模型可能在本地路径
-MODEL_PATH = Path("/workspace/models/DeepSeek-R1-Distill-Qwen-7B")
-if not MODEL_PATH.exists():
-    MODEL_PATH = MODEL_NAME  # fallback to HuggingFace download
+# 本地模型路径（RunPod 上已下载）；若不存在则 fallback 到 HF 下载
+_local_14b = Path("/workspace/models/DeepSeek-R1-Distill-Qwen-14B")
+_local_7b = Path("/workspace/models/DeepSeek-R1-Distill-Qwen-7B")
+if _local_14b.exists() and "14B" in MODEL_NAME:
+    MODEL_PATH = _local_14b
+elif _local_7b.exists() and "7B" in MODEL_NAME:
+    MODEL_PATH = _local_7b
+else:
+    MODEL_PATH = MODEL_NAME
 
 # numpy dtype
 NP_DTYPE = np.float16 if SAVE_DTYPE == "float16" else np.float32
@@ -177,41 +187,111 @@ def generate_with_hs(model, tokenizer, prompts, max_new_tokens=2048):
 
         text = tokenizer.decode(gen_ids[:gen_len], skip_special_tokens=False)
 
-        # 提取 hidden states（N 个 token = N 次 hook fire，含 prefill）
-        actual_steps = gen_len
+        # Hook 步数语义（HF generate 实际行为，不是 N+1 次 forward）：
+        #   N 个新 token 总共触发 N 次 forward —— prefill 那次已经产生了第 1 个 token 的 logits。
+        #   step 0         → prefill：prompt 最后一个 token 的 h（= 输入级信号，H3 用）
+        #   step k (1..N-1) → 生成 token k-1 产出后、预测 token k 之前的 h
+        #   最后一个生成 token（index N-1）的 h 捕获不到 —— 没有后续 forward。
+        # 因此 n_positions = gen_len（不是 gen_len+1）。
+        n_positions = gen_len if gen_len > 0 else 1  # 至少保留 prefill
+        n_save = min(N_SAVE_CHECKPOINTS, n_positions)
+        if n_save >= 2:
+            save_indices = np.linspace(0, n_positions - 1, n_save).astype(int)
+        elif n_save == 1:
+            save_indices = np.array([0], dtype=int)
+        else:
+            save_indices = np.array([], dtype=int)
+
+        # 从 hs_all 取出 sample i 的 checkpoint；batch>1 时 total_steps = max_gen_len+1，
+        # 对 gen_len 较短的 sample，save_indices 仍在合法范围内（clip 作为保险）。
+        n_hook_steps = None
         hs_by_layer = {}
         for layer_idx in LAYERS_TO_SAVE:
-            if hs_all[layer_idx] is not None:
+            if hs_all[layer_idx] is not None and n_save > 0:
                 total_steps = hs_all[layer_idx].shape[0]
-                trim = min(actual_steps, total_steps)
-                arr = hs_all[layer_idx][:trim, i, :]  # (n_tokens, hidden_dim)
+                if n_hook_steps is None:
+                    n_hook_steps = int(total_steps)
+                safe_indices = np.clip(save_indices, 0, total_steps - 1)
+                arr = hs_all[layer_idx][safe_indices, i, :]  # (n_save, hidden_dim)
                 hs_by_layer[layer_idx] = arr.astype(NP_DTYPE)
             else:
                 hs_by_layer[layer_idx] = np.zeros((0, 0), dtype=NP_DTYPE)
 
-        results.append((text, hs_by_layer))
+        results.append((text, hs_by_layer, gen_len, save_indices, n_hook_steps))
 
     return results
 
 
-def save_sample(output_dir, sample_id, prompt, text, hs_by_layer):
-    """保存一条样本的 hidden states + CoT 文本"""
+def _find_decode_marker(text):
+    """在 CoT 文本中查找最早的解码标志词。返回 (marker_name, char_pos) 或 (None, None)。"""
+    text_lower = text.lower()
+    best_pos = None
+    best_name = None
+    for m in DECODE_MARKERS:
+        p = text_lower.find(m.lower())
+        if p >= 0 and (best_pos is None or p < best_pos):
+            best_pos = p
+            best_name = m
+    return best_name, best_pos
+
+
+def save_sample(output_dir, sample_id, prompt, text, hs_by_layer, gen_len, save_indices, n_hook_steps=None):
+    """保存一条样本的 hidden states + CoT 文本 + 解码标志词元数据
+
+    安全约束（见 memory/feedback_harmful_payload_terminal.md）：
+    - 不把 prompt 原文写进 metadata（T2_harmful 可能是真实对抗文本）；改写长度 + SHA256 前缀。
+      原文如需回查，用 id 在 data/all_prompts.csv 里 join。
+    - `cot` 文本保留在磁盘以便后续分析；inspector 脚本禁止打印内容。
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Hidden states
+    # Hidden states（已下采样到 N_SAVE_CHECKPOINTS）
     np.savez_compressed(
         output_dir / f"hs_{sample_id:04d}.npz",
         **{f"layer_{k}": v for k, v in hs_by_layer.items()}
     )
 
-    # CoT 文本（append 模式）
+    # 解码标志词定位（char 位置 → 生成 token 位置 → checkpoint 索引）
+    # save_indices 索引 0 = prefill（prompt 最后 token 的 h），
+    # save_indices 索引 k (1..gen_len-1) = 产出生成 token k-1 之后的 h。
+    # 生成 token i 的对应 hook step = i + 1，但最后一个生成 token (i=gen_len-1)
+    # 没有后续 forward，h 未捕获 —— 钳到最近的已捕获 hook step (gen_len-1)。
+    marker_name, marker_char_pos = _find_decode_marker(text)
+    marker_token_pos = None
+    marker_token_pct = None
+    marker_checkpoint_idx = None
+    if marker_char_pos is not None and len(text) > 0 and gen_len > 0:
+        marker_token_pos = int(marker_char_pos / len(text) * gen_len)
+        marker_token_pct = float(marker_token_pos / gen_len) if gen_len > 0 else None
+        if len(save_indices) > 0:
+            marker_hook_step = min(marker_token_pos + 1, gen_len - 1)
+            marker_checkpoint_idx = int(np.searchsorted(save_indices, marker_hook_step))
+            marker_checkpoint_idx = min(marker_checkpoint_idx, len(save_indices) - 1)
+
+    prompt_str = prompt if isinstance(prompt, str) else str(prompt)
+    prompt_bytes = prompt_str.encode("utf-8", errors="replace")
+    prompt_sha8 = hashlib.sha256(prompt_bytes).hexdigest()[:8]
+
+    meta = {
+        "id": int(sample_id),
+        "prompt_len": len(prompt_str),
+        "prompt_sha8": prompt_sha8,
+        "cot": text,  # on-disk only; inspector must not print this
+        "cot_chars": len(text),
+        "n_gen_tokens": int(gen_len),
+        "n_hook_steps": int(n_hook_steps) if n_hook_steps is not None else None,
+        "n_checkpoints_saved": int(len(save_indices)),
+        "has_closed_think": "</think>" in text,
+        "decode_marker_found": marker_name is not None,
+        "decode_marker_name": marker_name,
+        "decode_marker_char_pos": marker_char_pos,
+        "decode_marker_token_pos": marker_token_pos,
+        "decode_marker_token_pct": marker_token_pct,
+        "decode_marker_checkpoint_idx": marker_checkpoint_idx,
+    }
     with open(output_dir / "cot_texts.jsonl", "a") as f:
-        f.write(json.dumps({
-            "id": sample_id,
-            "prompt": prompt[:200],  # 截断保存，节省空间
-            "cot": text
-        }, ensure_ascii=False) + "\n")
+        f.write(json.dumps(meta, ensure_ascii=False) + "\n")
 
 
 def main():
@@ -220,11 +300,14 @@ def main():
     parser.add_argument("--n", type=int, default=5, help="dry-run 条数")
     parser.add_argument("--start", type=int, default=0, help="从第几条开始（断点续跑）")
     parser.add_argument("--batch-size", type=int, default=1, help="batch 大小")
-    parser.add_argument("--max-tokens", type=int, default=2048, help="最大生成 token 数")
+    parser.add_argument("--max-tokens", type=int, default=TARGET_MAX_TOKENS,
+                        help=f"最大生成 token 数（默认 {TARGET_MAX_TOKENS}，对齐工业部署预算）")
+    parser.add_argument("--data-file", type=str, default=None,
+                        help="CSV 输入文件（默认 data/all_prompts.csv；用于 capability/isolation 测试切换数据源）")
     args = parser.parse_args()
 
     # 加载数据
-    prompts_file = DATA_DIR / "all_prompts.csv"
+    prompts_file = Path(args.data_file) if args.data_file else (DATA_DIR / "all_prompts.csv")
     if not prompts_file.exists():
         print(f"❌ {prompts_file} 不存在。请先运行 00_prepare_data.py")
         sys.exit(1)
@@ -232,13 +315,15 @@ def main():
     df = pd.read_csv(prompts_file)
     print(f"加载 {len(df)} 条 prompt")
 
+    # 先应用 --start（断点续跑 / 跳组），再应用 --dry-run 的 --n（取前 N 条）
+    # 顺序关键：先 start 后 head，才能实现 "从第 50 条起取 5 条" 的跳组 dry-run
+    if args.start > 0:
+        df = df.iloc[args.start:]
+        print(f"从第 {args.start} 条开始（断点续跑 / 跳组）")
+
     if args.dry_run:
         df = df.head(args.n)
         print(f"⚠️ Dry run 模式：只跑 {args.n} 条")
-
-    if args.start > 0:
-        df = df.iloc[args.start:]
-        print(f"从第 {args.start} 条开始（断点续跑）")
 
     # 加载模型
     model, tokenizer = load_model()
@@ -253,26 +338,38 @@ def main():
 
     rows = list(df.iterrows())
     done = 0
+    invariant_logged = False
     for batch_start in range(0, len(rows), bs):
         batch_rows = rows[batch_start:batch_start + bs]
         prompts = [row['prompt'] for _, row in batch_rows]
 
         results = generate_with_hs(model, tokenizer, prompts, args.max_tokens)
 
-        for (idx, row), (text, hs) in zip(batch_rows, results):
+        for (idx, row), (text, hs, gen_len, save_indices, n_hook_steps) in zip(batch_rows, results):
             tier = row['tier']
             label = row['label']
             out_dir = GENERATED_DIR / f"{tier}_{label}"
 
             has_think = "</think>" in text
-            n_tokens = len(list(hs.values())[0]) if hs else 0
+            n_ckpts = len(save_indices)
 
-            save_sample(out_dir, idx, row['prompt'], text, hs)
+            # One-shot hook-step invariant (HF generate: N forwards for N new tokens).
+            # For batch=1, n_hook_steps == gen_len; for batch>1, n_hook_steps == max(gen_len).
+            if args.dry_run and not invariant_logged and n_hook_steps is not None:
+                expected = gen_len
+                ok = "✅" if n_hook_steps == expected else ("⚠️" if n_hook_steps < expected else "ℹ️")
+                print(f"  [invariant] {ok} n_hook_steps={n_hook_steps} "
+                      f"vs gen_len={expected} (batch=1 expects equal, batch>1 expects >=)")
+                invariant_logged = True
+
+            save_sample(out_dir, idx, row['prompt'], text, hs,
+                        gen_len=gen_len, save_indices=save_indices,
+                        n_hook_steps=n_hook_steps)
             done += 1
 
             print(f"  [{done}/{total}] {tier}/{label} "
-                  f"tokens={n_tokens} "
-                  f"{'✅' if has_think else '⚠️ no </think>'}")
+                  f"gen_tokens={gen_len} ckpts={n_ckpts} "
+                  f"{'✅ closed' if has_think else '⚠️ no </think>'}")
 
     print(f"\n{'='*60}")
     print(f"✅ 全部完成。数据保存到 {GENERATED_DIR}")
