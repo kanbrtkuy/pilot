@@ -16,7 +16,14 @@ import numpy as np
 # 路径
 # ══════════════════════════════════════════════════
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent  # 0_pilot/
+# 自动检测项目根目录
+# Mac 本地: scripts in code/pilot/ → parent.parent = code → .parent.name == "code"
+# RunPod:   scripts at repo root  → parent = pilot_code/
+_script_dir = Path(__file__).resolve().parent
+if _script_dir.parent.name == "code":
+    PROJECT_ROOT = _script_dir.parent.parent
+else:
+    PROJECT_ROOT = _script_dir
 DATA_DIR = PROJECT_ROOT / "data"
 GENERATED_DIR = DATA_DIR / "generated"
 RESULTS_DIR = PROJECT_ROOT / "results"

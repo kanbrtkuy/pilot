@@ -38,10 +38,7 @@ def load_hs(group_dir, n_samples, layer_idx, position='mid'):
     position: 'first' | 'mid' | 'last' | 'inst_end'
     """
     states = []
-    for i in range(n_samples):
-        f = group_dir / f"hs_{i:04d}.npz"
-        if not f.exists():
-            continue
+    for f in sorted(Path(group_dir).glob("hs_*.npz")):
         hs = np.load(f)[f"layer_{layer_idx}"]  # (n_tokens, hidden_dim)
         n = len(hs)
         if n == 0:

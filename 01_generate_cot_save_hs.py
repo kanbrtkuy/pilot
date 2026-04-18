@@ -33,7 +33,9 @@ except ImportError:
     N_LAYERS = 28
     LAYERS_TO_SAVE = list(range(28))
     SAVE_DTYPE = "float16"
-    DATA_DIR = Path(__file__).parent.parent.parent / "data"
+    _dir = Path(__file__).resolve().parent
+    _root = _dir.parent.parent if _dir.parent.name == "code" else _dir
+    DATA_DIR = _root / "data"
     GENERATED_DIR = DATA_DIR / "generated"
 
 # RunPod 上模型可能在本地路径
@@ -51,6 +53,11 @@ def load_model():
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_PATH, trust_remote_code=True
     )
+    # Batch generation 需要 padding
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
         torch_dtype=torch.bfloat16,
@@ -66,33 +73,60 @@ def load_model():
 def make_capture_hook(cache, layer_idx):
     """
     生成 forward hook，捕获每个生成 token 最后位置的 hidden state。
-
-    挂在 model.model.layers[layer_idx] 上（residual stream output）。
+    在 GPU 上累积（clone），生成结束后统一转移到 CPU。
     """
     def hook_fn(module, input, output):
-        # output[0] shape: (batch=1, seq_len, hidden_dim)
-        h = output[0][0, -1, :].detach().cpu().to(torch.float32).numpy()
+        if isinstance(output, tuple):
+            activation = output[0]
+        else:
+            activation = output
+        # activation: (batch, seq_len, hidden_dim) — 保留在 GPU
+        h = activation[:, -1, :].detach().clone()
         cache[layer_idx].append(h)
     return hook_fn
 
 
-def generate_with_hs(model, tokenizer, prompt, max_new_tokens=2048):
+def generate_with_hs(model, tokenizer, prompts, max_new_tokens=2048):
     """
-    生成 CoT + 捕获全部层的 hidden states。
+    批量生成 CoT + 捕获全部层的 hidden states（GPU 上累积，一次转 CPU）。
 
-    返回:
-        text: str — 完整生成文本（含 <think>...</think>）
-        hs_by_layer: dict — {layer_idx: np.array(n_tokens, hidden_dim)}
+    Args:
+        prompts: list[str] — 一批 prompt
+        max_new_tokens: int
+
+    Returns:
+        list of (text, hs_by_layer) tuples
     """
-    # 构建输入（无 system prompt）
-    messages = [{"role": "user", "content": prompt}]
-    input_ids = tokenizer.apply_chat_template(
-        messages, tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="pt"
-    ).to(model.device)
+    batch_size = len(prompts)
 
-    # 准备 cache
+    # 逐条 apply_chat_template，手动左填充（保证与单条 tokenization 一致）
+    input_ids_list = []
+    for p in prompts:
+        messages = [{"role": "user", "content": p}]
+        ids = tokenizer.apply_chat_template(
+            messages, tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt"
+        )
+        input_ids_list.append(ids[0])
+
+    max_prompt_len = max(len(ids) for ids in input_ids_list)
+    padded_ids, attn_masks = [], []
+    for ids in input_ids_list:
+        pad_len = max_prompt_len - len(ids)
+        padded_ids.append(torch.cat([
+            torch.full((pad_len,), tokenizer.pad_token_id, dtype=ids.dtype),
+            ids
+        ]))
+        attn_masks.append(torch.cat([
+            torch.zeros(pad_len, dtype=torch.long),
+            torch.ones(len(ids), dtype=torch.long)
+        ]))
+
+    input_ids = torch.stack(padded_ids).to(model.device)
+    attention_mask = torch.stack(attn_masks).to(model.device)
+
+    # GPU cache
     cache = {layer_idx: [] for layer_idx in LAYERS_TO_SAVE}
 
     # 注册 hooks
@@ -107,6 +141,7 @@ def generate_with_hs(model, tokenizer, prompt, max_new_tokens=2048):
     with torch.no_grad():
         output_ids = model.generate(
             input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             temperature=1.0,
@@ -116,20 +151,47 @@ def generate_with_hs(model, tokenizer, prompt, max_new_tokens=2048):
     for hook in hooks:
         hook.remove()
 
-    # 解码文本
-    generated_ids = output_ids[0][input_ids.shape[1]:]
-    text = tokenizer.decode(generated_ids, skip_special_tokens=False)
-
-    # 组装 hidden states
-    hs_by_layer = {}
+    # GPU → CPU 一次性转移
+    hs_all = {}
     for layer_idx in LAYERS_TO_SAVE:
         if cache[layer_idx]:
-            arr = np.array(cache[layer_idx])  # (n_tokens, hidden_dim)
-            hs_by_layer[layer_idx] = arr.astype(NP_DTYPE)
+            stacked = torch.stack(cache[layer_idx])  # (n_steps, batch, hidden_dim)
+            hs_all[layer_idx] = stacked.cpu().to(torch.float32).numpy()
         else:
-            hs_by_layer[layer_idx] = np.zeros((0, 0), dtype=NP_DTYPE)
+            hs_all[layer_idx] = None
 
-    return text, hs_by_layer
+    del cache
+    torch.cuda.empty_cache()
+
+    # 分离每条 sample 的结果
+    results = []
+    for i in range(batch_size):
+        gen_ids = output_ids[i, max_prompt_len:]
+
+        # 找到实际生成长度（第一个 EOS 位置，用于裁剪 batch 内的 padding）
+        eos_mask = (gen_ids == tokenizer.eos_token_id)
+        if eos_mask.any():
+            gen_len = eos_mask.nonzero(as_tuple=False)[0].item() + 1
+        else:
+            gen_len = len(gen_ids)
+
+        text = tokenizer.decode(gen_ids[:gen_len], skip_special_tokens=False)
+
+        # 提取 hidden states（N 个 token = N 次 hook fire，含 prefill）
+        actual_steps = gen_len
+        hs_by_layer = {}
+        for layer_idx in LAYERS_TO_SAVE:
+            if hs_all[layer_idx] is not None:
+                total_steps = hs_all[layer_idx].shape[0]
+                trim = min(actual_steps, total_steps)
+                arr = hs_all[layer_idx][:trim, i, :]  # (n_tokens, hidden_dim)
+                hs_by_layer[layer_idx] = arr.astype(NP_DTYPE)
+            else:
+                hs_by_layer[layer_idx] = np.zeros((0, 0), dtype=NP_DTYPE)
+
+        results.append((text, hs_by_layer))
+
+    return results
 
 
 def save_sample(output_dir, sample_id, prompt, text, hs_by_layer):
@@ -157,6 +219,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="只跑前 N 条")
     parser.add_argument("--n", type=int, default=5, help="dry-run 条数")
     parser.add_argument("--start", type=int, default=0, help="从第几条开始（断点续跑）")
+    parser.add_argument("--batch-size", type=int, default=1, help="batch 大小")
+    parser.add_argument("--max-tokens", type=int, default=2048, help="最大生成 token 数")
     args = parser.parse_args()
 
     # 加载数据
@@ -180,27 +244,35 @@ def main():
     model, tokenizer = load_model()
 
     # 生成
+    total = len(df)
+    bs = args.batch_size
     print(f"\n{'='*60}")
-    print(f"开始生成 {len(df)} 条 CoT（全部 {len(LAYERS_TO_SAVE)} 层，{SAVE_DTYPE}）")
+    print(f"开始生成 {total} 条 CoT（batch={bs}，max_tokens={args.max_tokens}，"
+          f"{len(LAYERS_TO_SAVE)} 层，{SAVE_DTYPE}）")
     print(f"{'='*60}\n")
 
-    for idx, row in df.iterrows():
-        tier = row['tier']
-        label = row['label']
-        group = row.get('group', f"{tier}_{label}")
-        out_dir = GENERATED_DIR / f"{tier}_{label}"
+    rows = list(df.iterrows())
+    done = 0
+    for batch_start in range(0, len(rows), bs):
+        batch_rows = rows[batch_start:batch_start + bs]
+        prompts = [row['prompt'] for _, row in batch_rows]
 
-        text, hs = generate_with_hs(model, tokenizer, row['prompt'])
+        results = generate_with_hs(model, tokenizer, prompts, args.max_tokens)
 
-        # 检查 </think> 是否存在
-        has_think = "</think>" in text
-        n_tokens = len(list(hs.values())[0]) if hs else 0
+        for (idx, row), (text, hs) in zip(batch_rows, results):
+            tier = row['tier']
+            label = row['label']
+            out_dir = GENERATED_DIR / f"{tier}_{label}"
 
-        save_sample(out_dir, idx, row['prompt'], text, hs)
+            has_think = "</think>" in text
+            n_tokens = len(list(hs.values())[0]) if hs else 0
 
-        print(f"  [{idx+1}/{len(df)}] {tier}/{label} "
-              f"tokens={n_tokens} "
-              f"{'✅' if has_think else '⚠️ no </think>'}")
+            save_sample(out_dir, idx, row['prompt'], text, hs)
+            done += 1
+
+            print(f"  [{done}/{total}] {tier}/{label} "
+                  f"tokens={n_tokens} "
+                  f"{'✅' if has_think else '⚠️ no </think>'}")
 
     print(f"\n{'='*60}")
     print(f"✅ 全部完成。数据保存到 {GENERATED_DIR}")
