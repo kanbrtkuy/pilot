@@ -17,8 +17,11 @@ from pathlib import Path
 
 random.seed(42)
 
-# 创建输出目录
-DATA_DIR = Path(__file__).parent.parent.parent / "data"
+# 创建输出目录（复用 config.py 的路径解析逻辑）
+try:
+    from config import DATA_DIR
+except ImportError:
+    DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # ════════════════════════════════════════════════════════════
@@ -51,14 +54,17 @@ except Exception as e:
     harmful_raw = []
 
 # 无害原文：从 JailbreakBench 获取配对 benign
-print("下载 JailbreakBench benign...")
+# 用 HuggingFace datasets 直接取，绕开 jailbreakbench 包的 litellm 依赖冲突
+print("下载 JailbreakBench benign（via HuggingFace）...")
 try:
-    import jailbreakbench as jbb
-    benign_raw = [b.behavior for b in jbb.read_dataset("benign").behaviors]
+    from datasets import load_dataset
+    jbb_benign = load_dataset(
+        "JailbreakBench/JBB-Behaviors", "behaviors", split="benign"
+    )
+    benign_raw = [row['Goal'] for row in jbb_benign]
     print(f"  JailbreakBench benign: {len(benign_raw)} 条")
 except Exception as e:
     print(f"  ⚠️ JailbreakBench 下载失败: {e}")
-    print("  请先运行: pip install jailbreakbench")
     benign_raw = []
 
 if not harmful_raw or not benign_raw:
@@ -112,6 +118,7 @@ from datasets import load_dataset
 
 print("下载 WildJailbreak（首次可能需要几分钟）...")
 ds = load_dataset("allenai/wildjailbreak", "train",
+                  split="train",
                   delimiter="\t", keep_default_na=False)
 
 adv_harmful = [x for x in ds if x['data_type'] == 'adversarial_harmful']
